@@ -1,0 +1,16 @@
+**/__pycache__
+dataset/
+VAN/VAN-Segmantation/
+snapshots/
+log/
+results/
+results_display/
+others/
+./time_test.py
+./test.py
+./train_val.py
+./evaluate_for_R.py
+*.jpg
+*.png
+
+!dataset/datasets.py

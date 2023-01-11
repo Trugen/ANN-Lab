@@ -1,0 +1,230 @@
+# unchecked
+
+import jittor as jt
+from jittor import Module, nn
+import numpy as np
+import functools
+
+from cc_attention.functions import HorizontalVerticalAttention
+from utils.pyt_utils import load_model
+
+from inplace_abn import InPlaceABNSync
+# BatchNorm2d = functools.partial(InPlaceABNSync, activation='identity')
+BatchNorm2d = nn.BatchNorm2d
+
+class Dropout2d(Module):
+    def __init__(self, p=0.5, is_train=False):
+        '''
+        Randomly zero out entire channels, from "Efficient Object Localization Using Convolutional Networks"
+        input:
+            x: [N,C,H,W] or [N,C,L]
+        output:
+            y: same shape as x
+        '''
+        assert p >= 0 and p <= 1, "dropout probability has to be between 0 and 1, but got {}".format(p)
+        self.p = p
+        self.is_train = is_train
+
+    def execute(self, input):
+        output = input
+        shape = input.shape[:-2]
+        if self.p > 0 and self.is_train:
+            if self.p == 1:
+                output = jt.zeros(input.shape)
+            else:
+                noise = jt.random(shape)
+                noise = (noise > self.p).int()
+                output = output * noise.broadcast(input.shape, dims=[-2,-1]) / (1.0 - self.p) # div keep prob
+        return output
+
+
+affine_par = True
+
+
+def outS(i):
+    i = int(i)
+    i = (i+1)/2
+    i = int(np.ceil((i+1)/2.0))
+    i = (i+1)/2
+    return i
+
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+
+class Bottleneck(Module):
+    expansion = 4
+    def __init__(self, inplanes, planes, stride=1, dilation=1, downsample=None, fist_dilation=1, multi_grid=1):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1 = BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=dilation*multi_grid, dilation=dilation*multi_grid, bias=False)
+        self.bn2 = BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+        self.bn3 = BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU()           # TODO: no difference now
+        self.relu_inplace = nn.ReLU()   # TODO: no difference now
+        self.downsample = downsample
+        self.dilation = dilation
+        self.stride = stride
+
+    def execute(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out = out + residual      
+        out = self.relu_inplace(out)
+
+        return out
+
+class PSPModule(Module):
+    """
+    Reference: 
+        Zhao, Hengshuang, et al. *"Pyramid scene parsing network."*
+    """
+    def __init__(self, features, out_features=512, sizes=(1, 2, 3, 6)):
+        super(PSPModule, self).__init__()
+
+        self.stages = []
+        self.stages = nn.Sequential([self._make_stage(features, out_features, size) for size in sizes])     # TODO
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(features+len(sizes)*out_features, out_features, kernel_size=3, padding=1, dilation=1, bias=False),
+            InPlaceABNSync(out_features),
+            Dropout2d(0.1)
+            )
+
+    def _make_stage(self, features, out_features, size):
+        prior = nn.AdaptiveAvgPool2d(output_size=(size, size))
+        conv = nn.Conv2d(features, out_features, kernel_size=1, bias=False)
+        bn = InPlaceABNSync(out_features)
+        return nn.Sequential(prior, conv, bn)
+
+    def execute(self, feats):
+        h, w = feats.size(2), feats.size(3)
+        priors = [nn.upsample(img=stage(feats), size=(h, w), mode='bilinear', align_corners=True) for stage in self.stages] + [feats]
+        bottle = self.bottleneck(jt.concat(priors, 1))
+        return bottle
+
+class RHVAModule(Module):
+    def __init__(self, in_channels, out_channels, num_classes):
+        super(RHVAModule, self).__init__()
+        inter_channels = in_channels // 4
+        self.conva = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
+                                   BatchNorm2d(inter_channels))
+        self.hva = HorizontalVerticalAttention(inter_channels)
+        self.convb = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
+                                   BatchNorm2d(inter_channels))
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels+inter_channels, out_channels, kernel_size=3, padding=1, dilation=1, bias=False),
+            BatchNorm2d(out_channels),
+            Dropout2d(0.1),
+            nn.Conv2d(512, num_classes, kernel_size=1, stride=1, padding=0, bias=True)  # TODO: why magic number 512?
+            )
+
+    def execute(self, x, recurrence=1):
+        output = self.conva(x)
+        for i in range(recurrence):
+            output = self.hva(output)
+        output = self.convb(output)
+
+        output = self.bottleneck(jt.concat([x, output], 1))
+        return output
+
+class ResNet(nn.Module):
+    def __init__(self, block, layers, num_classes, criterion, recurrence):
+        self.inplanes = 128
+        super(ResNet, self).__init__()
+        self.conv1 = conv3x3(3, 64, stride=2)
+        self.bn1 = BatchNorm2d(64)
+        self.relu1 = nn.ReLU()
+        self.conv2 = conv3x3(64, 64)
+        self.bn2 = BatchNorm2d(64)
+        self.relu2 = nn.ReLU()
+        self.conv3 = conv3x3(64, 128)
+        self.bn3 = BatchNorm2d(128)
+        self.relu3 = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, ceil_mode=True) # change
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=1, dilation=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=1, dilation=4, multi_grid=(1,1,1))
+        #self.layer5 = PSPModule(2048, 512)
+        self.head = RHVAModule(2048, 512, num_classes)
+
+        self.dsn = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, stride=1, padding=1),
+            BatchNorm2d(512),
+            Dropout2d(0.1),
+            nn.Conv2d(512, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            )
+        self.criterion = criterion
+        self.recurrence = recurrence
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilation=1, multi_grid=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                BatchNorm2d(planes * block.expansion,affine = affine_par))
+
+        layers = []
+        generate_multi_grid = lambda index, grids: grids[index%len(grids)] if isinstance(grids, tuple) else 1
+        layers.append(block(self.inplanes, planes, stride,dilation=dilation, downsample=downsample, multi_grid=generate_multi_grid(0, multi_grid)))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes, dilation=dilation, multi_grid=generate_multi_grid(i, multi_grid)))
+
+        return nn.Sequential(*layers)
+
+    def execute(self, x, labels=None):
+        # print('=========== START EXECUTING ===========')
+        x = self.relu1(self.bn1(self.conv1(x)))
+        # print('RELU1')
+        x = self.relu2(self.bn2(self.conv2(x)))
+        # print('RELU2')
+        x = self.relu3(self.bn3(self.conv3(x)))
+        # print('RELU3')
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x_dsn = self.dsn(x)
+        x = self.layer4(x)
+        x = self.head(x, self.recurrence)
+        outs = [x, x_dsn]
+
+        if self.criterion is not None and labels is not None:
+            return self.criterion(outs, labels)
+        else:
+            return outs
+
+
+def Seg_Model(num_classes, criterion=None, pretrained_model=None, recurrence=2, **kwargs):
+    # model = ResNet(Bottleneck,[3, 4, 23, 3], num_classes, criterion, recurrence)
+    model = ResNet(Bottleneck,[3, 4, 12, 3], num_classes, criterion, recurrence)
+
+    if pretrained_model is not None:
+        model = load_model(model, pretrained_model)
+
+    return model
